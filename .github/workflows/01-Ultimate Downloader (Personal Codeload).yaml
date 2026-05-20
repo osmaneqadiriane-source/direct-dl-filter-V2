@@ -1,0 +1,157 @@
+name: 🚀 Ultimate Downloader (Personal Codeload)
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'آدرس‌های دانلود (با فاصله از هم جدا کنید)'
+        required: true
+        type: string
+      mode:
+        description: 'حالت خروجی'
+        required: false
+        default: 'normal'
+        type: choice
+        options:
+          - normal
+          - zip
+      split_size:
+        description: 'سایز هر پارت به مگابایت (حداکثر 99)'
+        required: false
+        default: '90'
+        type: string
+      password:
+        description: 'رمز عبور برای فایل‌های زیپ (اختیاری)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  download-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y aria2 zip curl bc python3
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git config --global http.postBuffer 524288000
+          git config --global core.compression 0
+
+      - name: Smart Download Engine
+        run: |
+          URLS="${{ github.event.inputs.urls }}"
+          mkdir -p tmp_downloads downloads
+          
+          get_clean_name() {
+            local RAW=$(basename "${1%%\?*}" | sed 's/%20/ /g' | sed 's/[<>:"|?*]/_/g')
+            [ -z "$RAW" ] && echo "file_$(date +%s)" || echo "$RAW"
+          }
+
+          for URL in $URLS; do
+            FILE=$(get_clean_name "$URL")
+            aria2c --max-connection-per-server=16 --split=16 --min-split-size=1M \
+                   --dir="tmp_downloads" -o "$FILE" "$URL" || \
+            curl -L --retry 5 -o "tmp_downloads/$FILE" "$URL"
+
+            if [ -f "tmp_downloads/$FILE" ]; then
+              SIZE=$(stat -c%s "tmp_downloads/$FILE")
+              if [ "$SIZE" -lt 2000 ] && grep -qi "html" "tmp_downloads/$FILE"; then
+                rm "tmp_downloads/$FILE"
+                CHUNK=20000000
+                START=0
+                INDEX=0
+                while true; do
+                  END=$((START + CHUNK - 1))
+                  curl -L -H "Range: bytes=$START-$END" -o "tmp_downloads/$FILE.part$INDEX" "$URL" || break
+                  [ $(stat -c%s "tmp_downloads/$FILE.part$INDEX") -lt $CHUNK ] && break
+                  START=$((END + 1))
+                  INDEX=$((INDEX + 1))
+                done
+                cat tmp_downloads/$FILE.part* > "tmp_downloads/$FILE"
+                rm tmp_downloads/$FILE.part*
+              fi
+            fi
+          done
+
+      - name: Process, Split and Create Table
+        run: |
+          MODE="${{ github.event.inputs.mode }}"
+          PASS="${{ github.event.inputs.password }}"
+          SPLIT_MB="${{ github.event.inputs.split_size }}"
+          REPO_NAME="${{ github.repository }}"
+          BRANCH_NAME="${{ github.ref_name }}"
+          BACKUP_DIR="/tmp/final_files"
+          mkdir -p "$BACKUP_DIR"
+
+          cd tmp_downloads
+          for FILE in *; do
+            [ -f "$FILE" ] || continue
+            FILE_SIZE_HUMAN=$(du -h "$FILE" | cut -f1)
+            BASENAME="${FILE%.*}"
+            FOLDER_NAME="${BASENAME}_$(date +%s)"
+            TARGET_PATH="$BACKUP_DIR/$FOLDER_NAME"
+            mkdir -p "$TARGET_PATH"
+            
+            # عملیات فشرده‌سازی و پارت‌بندی دقیقاً مشابه نسخه شما
+            if [ $(stat -c%s "$FILE") -gt $((SPLIT_MB * 1024 * 1024)) ] && [ "$MODE" != "zip" ]; then
+              if [ -n "$PASS" ]; then
+                zip -0 -s "${SPLIT_MB}m" -P "$PASS" "$TARGET_PATH/${BASENAME}.zip" "$FILE"
+              else
+                zip -0 -s "${SPLIT_MB}m" "$TARGET_PATH/${BASENAME}.zip" "$FILE"
+              fi
+            else
+              if [ -n "$PASS" ]; then
+                zip -j -P "$PASS" "$TARGET_PATH/${BASENAME}.zip" "$FILE"
+              else
+                zip -j "$TARGET_PATH/${BASENAME}.zip" "$FILE"
+              fi
+            fi
+            
+            # لینک اختصاصی و مستقیم Codeload برای دریافت یکجای کل مخزن
+            CODELOAD_LINK="https://codeload.github.com/$REPO_NAME/zip/refs/heads/$BRANCH_NAME"
+
+            # ایجاد فایل راهنما با ساختار دانلود یک مرحله‌ای (Codeload)
+            echo "## 📦 دانلود کل پروژه (تمام پارت‌ها یکجا)" > "$TARGET_PATH/README.md"
+            echo "برای دانلود تمام فایل‌های این پوشه به صورت یکجا، روی لینک زیر کلیک کنید:" >> "$TARGET_PATH/README.md"
+            echo "### [📥 دانلود کل این مخزن بصورت ZIP]($CODELOAD_LINK)" >> "$TARGET_PATH/README.md"
+            echo "" >> "$TARGET_PATH/README.md"
+            echo "---" >> "$TARGET_PATH/README.md"
+            echo "### 📊 مشخصات فایل دانلود شده" >> "$TARGET_PATH/README.md"
+            echo "- **نام اصلی:** $FILE" >> "$TARGET_PATH/README.md"
+            echo "- **حجم کل:** $FILE_SIZE_HUMAN" >> "$TARGET_PATH/README.md"
+            echo "- **سایز تنظیم شده برای پارت‌ها:** ${SPLIT_MB}MB" >> "$TARGET_PATH/README.md"
+            echo "- **تعداد قطعات ایجاد شده:** $(ls "$TARGET_PATH" | grep -v "README.md" | wc -l)" >> "$TARGET_PATH/README.md"
+            
+            echo "$FILE ($FILE_SIZE_HUMAN)" >> /tmp/summary.txt
+          done
+          echo "$BACKUP_DIR" > /tmp/backup_path.txt
+
+      - name: Incremental Push
+        run: |
+          BACKUP=$(cat /tmp/backup_path.txt)
+          SUMMARY=$(cat /tmp/summary.txt | tr '\n' ' | ')
+          BRANCH=${GITHUB_REF_NAME}
+          mkdir -p downloads
+          cp -r "$BACKUP"/* downloads/
+
+          git add downloads/
+          git commit -m "🚀 Files: $SUMMARY [skip ci]" || exit 0
+          
+          for i in {1..5}; do
+            git pull --rebase origin $BRANCH
+            git push origin $BRANCH && break || sleep 10
+          done
